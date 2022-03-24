@@ -36,9 +36,21 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
-
-        net_output = model(**sample['net_input'])
-        loss, nll_loss, length_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
+        pp = True
+        if pp:
+            import torch
+            group = torch.distributed.new_group(ranks=[0, 1], backend='nccl')
+            updated_sample = self.sync_samples(sample, group)
+            if torch.distributed.get_rank() == 1:
+                sample = updated_sample
+            net_output = model(**sample['net_input'], group=group)
+            if torch.distributed.get_rank() == 1:
+                loss, nll_loss, length_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
+            else:
+                loss, nll_loss, length_loss = torch.zeros(1), torch.zeros(1), torch.zeros(1)
+        else:
+            net_output = model(**sample['net_input'])
+            loss, nll_loss, length_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens']
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,
@@ -49,6 +61,56 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
             'sample_size': sample_size,
         }
         return loss, sample_size, logging_output
+
+    def sync_samples(self, sample, group):
+        import torch
+        device = torch.device('cuda:' + str(torch.distributed.get_rank()))
+        for key in sample.keys():
+            if isinstance(sample[key], dict):
+                for inside_key in sample[key].keys():
+                    update_data = self.send_recv(sample[key][inside_key], group, device, inside_key)
+                    if torch.distributed.get_rank() == 1:
+                        sample[key][inside_key] = update_data
+            else:
+                update_data = self.send_recv(sample[key], group, device, key)
+                if torch.distributed.get_rank() == 1:
+                    sample[key] = update_data
+        if torch.distributed.get_rank() == 1:
+            return sample
+
+    def send_recv(self, data, group, device, name):
+        import torch
+        print('syncing: ', name)
+        is_tensor = isinstance(data, torch.Tensor)
+        len_size = len(data.shape) if is_tensor else 1
+        shape = torch.zeros(len_size, device=device)
+        if torch.distributed.get_rank() == 0:
+            if is_tensor:
+                for i in range(len_size):
+                    shape[i] = data.shape[i]
+            else:
+                shape[0] = 1
+            torch.distributed.send(shape, dst=1, group=group)
+            if not is_tensor:
+                data = torch.tensor([data], device=device, dtype=torch.int64)
+            torch.distributed.send(data, dst=1, group=group)
+            return None
+        else:
+            torch.distributed.recv(shape, src=0, group=group)
+            shape_np = shape.cpu().detach().numpy().astype('int32')
+            size = []
+            for i in shape_np:
+                size.append(i)
+            size = tuple(size)
+            data = torch.empty(
+                size,
+                device=device,
+                requires_grad=False,
+                dtype=data.dtype if is_tensor else torch.int64)
+            torch.distributed.recv(data, src=0, group=group)
+            if not is_tensor:
+                data = data.cpu().detach().numpy().astype('int64')[0]
+            return data
 
     def compute_loss(self, model, net_output, sample, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)

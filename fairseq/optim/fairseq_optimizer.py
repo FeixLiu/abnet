@@ -69,9 +69,28 @@ class FairseqOptimizer(object):
             for group in self.optimizer.param_groups:
                 group.update(optimizer_overrides)
 
-    def backward(self, loss):
+    def backward(self, loss, pp_checkpoint=None, group=None):
         """Computes the sum of gradients of the given tensor w.r.t. graph leaves."""
-        loss.backward()
+        if not pp_checkpoint or len(pp_checkpoint) == 0:
+            loss.backward()
+        else:
+            # pp_checkpoint[0] -> bert_encoder_out
+            # pp_checkpoint[1] -> predicted_lengths
+            torch.cuda.synchronize(device=torch.distributed.get_rank())
+            if torch.distributed.get_rank() == 1:
+                loss.backward()
+                torch.distributed.send(pp_checkpoint[0].grad, dst=1, group=group)
+                torch.distributed.send(pp_checkpoint[1].grad, dst=1, group=group)
+            else:
+                device = torch.device('cuda:0')
+                pp_checkpoint[0].grad = torch.empty(pp_checkpoint[0].shape, device=device)
+                pp_checkpoint[1].grad = torch.empty(pp_checkpoint[1].shape, device=device)
+                torch.distributed.recv(pp_checkpoint[0].grad, src=0, group=group)
+                torch.distributed.recv(pp_checkpoint[1].grad, src=0, group=group)
+                torch.autograd.backward(
+                    [pp_checkpoint[0], pp_checkpoint[1]],
+                    grad_tensors=[pp_checkpoint[0].grad, pp_checkpoint[1].grad])
+
 
     def multiply_grads(self, c):
         """Multiplies grads by a constant *c*."""

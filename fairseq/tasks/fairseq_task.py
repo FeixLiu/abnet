@@ -230,11 +230,13 @@ class FairseqTask(object):
         """
         model.train()
         loss, sample_size, logging_output = criterion(model, sample)
+        pp_checkpoint = model.send_recv_vars
+        group = model.group
         
         #input()
         if ignore_grad:
             loss *= 0
-        optimizer.backward(loss)
+        optimizer.backward(loss, pp_checkpoint, group)
         # for name, param in model.named_parameters(): 
         #     print(name, param, True if param.grad is not None else False)
         return loss, sample_size, logging_output

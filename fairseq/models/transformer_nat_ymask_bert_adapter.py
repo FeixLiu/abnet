@@ -68,6 +68,8 @@ class TransformerNatYmaskBertTwoAdapter(FairseqEncoderDecoderModel):
         self.mask_cls_sep = args.mask_cls_sep
         self.max_source_positions = args.max_source_positions
         self.max_target_positions = args.max_target_positions
+        self.send_recv_vars = []
+        self.group = None
 
     @staticmethod
     def add_args(parser):
@@ -136,6 +138,7 @@ class TransformerNatYmaskBertTwoAdapter(FairseqEncoderDecoderModel):
         """Build a new model instance."""
 
         # make sure all arguments are present in older models
+        pp = True
         base_architecture(args)
 
         if not hasattr(args, 'max_source_positions'):
@@ -149,25 +152,84 @@ class TransformerNatYmaskBertTwoAdapter(FairseqEncoderDecoderModel):
         tgt_berttokenizer = BertTokenizer.from_pretrained(args.decoder_bert_model_name)
         assert src_berttokenizer.pad()==tgt_berttokenizer.pad()
 
-        bertdecoder = BertAdapterDecoderFull.from_pretrained(args.decoder_bert_model_name, args, from_scratch=args.train_from_scratch)
         enc_top_layer_adapter = getattr(args, 'enc_top_layer_adapter', -1)
         adapter_dimension = getattr(args, 'adapter_dimension', 2048)
-        bertencoder = BertModelWithAdapter.from_pretrained(args.bert_model_name, adapter_dimension, enc_top_layer_adapter, from_scratch=args.train_from_scratch)
-        return cls(bertencoder, bertdecoder, src_berttokenizer, tgt_berttokenizer, args)
 
-    def forward(self, src_tokens, src_lengths, prev_output_tokens, **kwargs):
-        bert_encoder_padding_mask = src_tokens.eq(self.berttokenizer.pad())
+        if pp:
+            if torch.distributed.get_rank() == 0:
+                bertencoder = BertModelWithAdapter.from_pretrained(args.bert_model_name,
+                                                                   adapter_dimension,
+                                                                   enc_top_layer_adapter,
+                                                                   from_scratch=args.train_from_scratch)
+                return cls(bertencoder, None, src_berttokenizer, tgt_berttokenizer, args)
+            else:
+                bertdecoder = BertAdapterDecoderFull.from_pretrained(args.decoder_bert_model_name,
+                                                                     args,
+                                                                     from_scratch=args.train_from_scratch)
+                return cls(None, bertdecoder, src_berttokenizer, tgt_berttokenizer, args)
+        else:
+            bertdecoder = BertAdapterDecoderFull.from_pretrained(args.decoder_bert_model_name, args, from_scratch=args.train_from_scratch)
+            bertencoder = BertModelWithAdapter.from_pretrained(args.bert_model_name, adapter_dimension, enc_top_layer_adapter, from_scratch=args.train_from_scratch)
+            return cls(bertencoder, bertdecoder, src_berttokenizer, tgt_berttokenizer, args)
 
-        bert_encoder_out, _, predicted_lengths = self.encoder(src_tokens, attention_mask=1-bert_encoder_padding_mask.float())
-        bert_encoder_out = bert_encoder_out.permute(1,0,2).contiguous()
+    def forward(self, src_tokens, src_lengths, prev_output_tokens, group=None, **kwargs):
+        pp = True
+        if pp:
+            assert group is not None
+            self.group = group
+            bert_encoder_padding_mask = src_tokens.eq(self.berttokenizer.pad())
+            device = torch.device('cuda:' + str(torch.distributed.get_rank()))
+            bert_encoder_out_shape = torch.zeros(3, device=device)
+            predicted_lengths_shape = torch.zeros(2, device=device)
+            if torch.distributed.get_rank() == 0:
+                bert_encoder_out, _, predicted_lengths = self.encoder(src_tokens, attention_mask=1-bert_encoder_padding_mask.float())
+                bert_encoder_out = bert_encoder_out.permute(1, 0, 2).contiguous()
+                for i in range(3):
+                    bert_encoder_out_shape[i] = bert_encoder_out.shape[i]
+                for i in range(2):
+                    predicted_lengths_shape[i] = predicted_lengths.shape[i]
+                torch.distributed.send(bert_encoder_out_shape, dst=1, group=group)
+                torch.distributed.send(predicted_lengths_shape, dst=1, group=group)
+                torch.distributed.send(bert_encoder_out, dst=1, group=group)
+                torch.distributed.send(predicted_lengths, dst=1, group=group)
+                self.send_recv_vars = [bert_encoder_out, predicted_lengths]
+                return None
+            else:
+                torch.distributed.recv(bert_encoder_out_shape, src=0, group=group)
+                torch.distributed.recv(predicted_lengths_shape, src=0, group=group)
+                bert_encoder_out_shape_np = bert_encoder_out_shape.cpu().detach().numpy().astype('int32')
+                predicted_lengths_shape_np = predicted_lengths_shape.cpu().detach().numpy().astype('int32')
+                bert_encoder_out = torch.empty(
+                    (bert_encoder_out_shape_np[0], bert_encoder_out_shape_np[1], bert_encoder_out_shape_np[2]),
+                    device=device,
+                    requires_grad=True)
+                predicted_lengths = torch.empty(
+                    (predicted_lengths_shape_np[0], predicted_lengths_shape_np[1]),
+                    device=device,
+                    requires_grad=True)
+                torch.distributed.recv(bert_encoder_out, src=0, group=group)
+                torch.distributed.recv(predicted_lengths, src=0, group=group)
+                self.send_recv_vars = [bert_encoder_out, predicted_lengths]
+                encoder_out = {
+                    'encoder_out': bert_encoder_out,
+                    'encoder_padding_mask': bert_encoder_padding_mask,
+                    'predicted_lengths': predicted_lengths,
+                }
+                decoder_out, _ = self.decoder(prev_output_tokens, encoder_out=encoder_out, padding_idx=self.berttokenizer.pad())
+                return decoder_out, {'predicted_lengths': predicted_lengths}
+        else:
+            bert_encoder_padding_mask = src_tokens.eq(self.berttokenizer.pad())
 
-        encoder_out = {
-            'encoder_out': bert_encoder_out,
-            'encoder_padding_mask': bert_encoder_padding_mask,
-            'predicted_lengths': predicted_lengths,
-        }
-        decoder_out, _ = self.decoder(prev_output_tokens, encoder_out=encoder_out, padding_idx=self.berttokenizer.pad())
-        return decoder_out, {'predicted_lengths': predicted_lengths}
+            bert_encoder_out, _, predicted_lengths = self.encoder(src_tokens, attention_mask=1-bert_encoder_padding_mask.float())
+            bert_encoder_out = bert_encoder_out.permute(1,0,2).contiguous()
+
+            encoder_out = {
+                'encoder_out': bert_encoder_out,
+                'encoder_padding_mask': bert_encoder_padding_mask,
+                'predicted_lengths': predicted_lengths,
+            }
+            decoder_out, _ = self.decoder(prev_output_tokens, encoder_out=encoder_out, padding_idx=self.berttokenizer.pad())
+            return decoder_out, {'predicted_lengths': predicted_lengths}
 
     def max_positions(self):
         """Maximum length supported by the model."""

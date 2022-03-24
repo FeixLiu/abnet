@@ -52,17 +52,18 @@ def main(args, init_distributed=False):
     finetune_embeddings = getattr(args, 'finetune_embeddings', False)
 
     if use_adapter_bert:
-        for name, param in model.encoder.named_parameters():
-            param.requires_grad = False
-            if finetune_whole_encoder:
-                param.requires_grad = True
-                continue
-            if finetune_embeddings:
-                if 'embedding' in name:
+        if hasattr(model, 'encoder') and model.encoder:
+            for name, param in model.encoder.named_parameters():
+                param.requires_grad = False
+                if finetune_whole_encoder:
                     param.requires_grad = True
-            if 'adapter' in name or 'embed_lengths' in name:
-                param.requires_grad = True
-        if hasattr(model, 'decoder'):
+                    continue
+                if finetune_embeddings:
+                    if 'embedding' in name:
+                        param.requires_grad = True
+                if 'adapter' in name or 'embed_lengths' in name:
+                    param.requires_grad = True
+        if hasattr(model, 'decoder') and model.decoder:
             for name, param in model.decoder.named_parameters():
                 param.requires_grad = False
                 if finetune_whole_encoder:

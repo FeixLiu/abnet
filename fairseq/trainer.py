@@ -236,6 +236,7 @@ class Trainer(object):
 
     def train_step(self, samples, dummy_batch=False, raise_oom=False):
         """Do forward, backward and parameter update."""
+        pp = True
         if self._dummy_batch is None:
             self._dummy_batch = samples[0]
 
@@ -244,7 +245,7 @@ class Trainer(object):
         self.criterion.train()
         self.zero_grad()
 
-        if not dummy_batch:
+        if not dummy_batch and not pp:
             self.meters['train_wall'].start()
 
         # forward and backward pass
@@ -266,7 +267,7 @@ class Trainer(object):
                     # all-reduce in the last backwards pass. Currently the
                     # *accumulate_grads* flag is only supported by
                     # LegacyDistributedDataParallel.
-                    if i < len(samples) - 1:
+                    if i < len(samples) - 1 and not pp:
                         self.model.accumulate_grads = True
                     else:
                         self.model.accumulate_grads = False
@@ -307,7 +308,7 @@ class Trainer(object):
 
         # gather logging outputs from all replicas
         if self.args.distributed_world_size > 1 and (
-            (not self.args.use_bmuf)
+            (not self.args.use_bmuf and not pp)
             or (
                 self.args.use_bmuf
                 and (self.get_num_updates() + 1) % self.args.global_sync_iter == 0
